@@ -19,8 +19,8 @@ class ProcessMonitor(threading.Thread):
         try:
             while not self._stop_event.is_set():
                 if not self.check_process():
-                    print(f"Process '{self.process_name}' is not running. Resetting note_intensity.")
-                    self.midi_monitor.reset_note_intensity()
+                    print(f"Process '{self.process_name}' is not running. Resetting note_state.")
+                    self.midi_monitor.reset_note_state()
                 time.sleep(5)  # Check every 5 seconds
         except KeyboardInterrupt:
             pass
@@ -40,19 +40,39 @@ class MidiMonitor(threading.Thread):
         self.loopback_device_name = loopback_device_name
         self.process_name = process_name
         self._stop_event = threading.Event()
-        self.note_intensity = {}  # Dictionary to store note intensity values
+        self.note_state = {}  # Dictionary to store note intensity values
 
     def stop(self):
         self._stop_event.set()
 
-    def reset_note_intensity(self):
-        self.note_intensity = {}  # Reset note intensity dictionary
+    def reset_note_state(self):
+        self.note_state = {}  # Reset note intensity dictionary
 
     def send_note_on(self, note, channel, velocity=1):
-        with mido.open_output(self.output_device_name) as port: # TODO: figure out how to do a loopback input
+        with mido.open_output(self.output_device_name) as port:
             port.send(mido.Message('note_on', note=note, velocity=velocity, channel=channel))
 
-    def input_thread_func(self):
+    def loopback_thread_func(self):
+        try:
+            with mido.open_input(self.loopback_device_name) as port:
+                print(f"Monitoring MIDI input messages from {self.loopback_device_name}. Press Ctrl+C to exit.")
+                for message in port:
+                    if message.type == 'note_on':
+                        # Update note intensity value
+                        if message.velocity > 0:
+                            self.note_state[(message.note, message.channel)] = True
+                        elif message.velocity == 0:
+                            self.note_state[(message.note, message.channel)] = False
+
+                        print("loopback", message)
+                        print("loopback", self.note_state)
+                    
+                    if self._stop_event.is_set():
+                        break
+        except KeyboardInterrupt:
+            pass
+
+    def receiver_thread_func(self):
         try:
             with mido.open_input(self.input_device_name) as port:
                 print(f"Monitoring MIDI input messages from {self.input_device_name}. Press Ctrl+C to exit.")
@@ -63,56 +83,52 @@ class MidiMonitor(threading.Thread):
         except KeyboardInterrupt:
             pass
 
-    def loopback_thread_func(self):
-        try:
-            with mido.open_input(self.loopback_device_name) as port:
-                print(f"Monitoring MIDI input messages from {self.loopback_device_name}. Press Ctrl+C to exit.")
-                for message in port:
-                    if message.type == 'note_on':
-                        # Update note intensity value
-                        if message.velocity > 0:
-                            self.note_intensity[(message.note, message.channel)] = True
-                        elif message.velocity == 0:
-                            self.note_intensity[(message.note, message.channel)] = False
-
-                        print("loopback", message)
-                        print("loopback", self.note_intensity)
-                    
-                    if self._stop_event.is_set():
-                        break
-        except KeyboardInterrupt:
-            pass
-
     def handle_midi_message(self, message):
-        # TODO: figure out how to have a note_on msg that only turns something on
+
+        note_channel = (message.note, message.channel)
+
         if message.type == 'note_on':
+            # Velocity 127 is special handling code for only turning buttons on if they're off
             if message.velocity == 127:
-                note_channel = (message.note, message.channel)
-                time.sleep(0.05)
-                if note_channel in self.note_intensity and not self.note_intensity[note_channel]:
-                    self.send_note_on(message.note, message.channel) #toggle it back on
-        if message.type == 'note_off':
-            if message.note == 127:
-                for key in list(self.note_intensity.keys()):
-                    if self.note_intensity[key] is True:
-                        self.send_note_on(key[0], key[1])
+                # Check if we know the current state of the note
+                if note_channel in self.note_state:
+                    # Only react to notes that have been turned off
+                    if not self.note_state[note_channel]:
+                        self.send_note_on(message.note, message.channel) # Toggle the note on
+                else:
+                    # Since we don't know the state, assume it is off so we want to turn it on
+                    self.send_note_on(message.note, message.channel) # Toggle the note on
             else:
-                # Remove note intensity value upon note off event
-                note_channel = (message.note, message.channel)
-                if note_channel in self.note_intensity and self.note_intensity[note_channel]:
-                    self.send_note_on(message.note, message.channel)
+                # If we're not using the special velocity code, just pass the message along
+                self.send_note_on(message.note, message.channel) # Toggle the note
+
+        elif message.type == 'note_off':
+            # Note 127 is special handling code to turn off any active buttons
+            if message.note == 127:
+                # Iterate over all known notes we have state for
+                for key in list(self.note_state.keys()):
+                    if self.note_state[key] is True: # Only turn off notes that are on
+                        self.send_note_on(key[0], key[1]) # Toggle the note off
+            else:
+                # Check if we know the current state of the note
+                if note_channel in self.note_state:
+                    # Only react to notes that are on
+                    if self.note_state[note_channel] is True:
+                        self.send_note_on(message.note, message.channel) # Toggle the note off
 
         # Print the MIDI message
         print(message)
-        print(self.note_intensity)
+        print(self.note_state)
 
     def run(self):
         process_monitor = ProcessMonitor(self.process_name, self)
         process_monitor.start()
 
-        input_thread = threading.Thread(target=self.input_thread_func)
-        input_thread.start()
+        # This thread processes the receiver (ProPresenter) msgs and replays them to the output device
+        receiver_thread = threading.Thread(target=self.receiver_thread_func)
+        receiver_thread.start()
 
+        # This thread recieves msgs from ShowXpress which signal the button states
         loopback_thread = threading.Thread(target=self.loopback_thread_func)
         loopback_thread.start()
 
@@ -124,7 +140,7 @@ class MidiMonitor(threading.Thread):
         finally:
             process_monitor.stop()
             process_monitor.join()
-            input_thread.join()
+            receiver_thread.join()
             loopback_thread.join()
 
 def stop():
@@ -136,9 +152,22 @@ def main():
     # Example: print(mido.get_input_names())
     print(mido.get_input_names())
     print(mido.get_output_names())
-    input_device_name = 'Steinberg UR22mkII -1 0'
-    loopback_device_name = 'loopMIDI Port 1'
-    output_device_name = 'USB MIDI Interface 3'
+
+    # Hardware is setup as the following:
+    # ProPresenter into USB MIDI Interface 2 (Input)
+    # USB MIDI Interface 2 recieves PP MIDI msgs and determines if we need to pass that message a long
+    # to the USB MIDI Interface 3 (Output) which is physically connected to the Steinberg UR22mkII
+    # which is what's actually being used to toggle buttons in ShowXpress
+    # and the loopMIDI Port 1 is recieving msgs from ShowXpress as buttons are toggled on/off and is
+    # the primary method of state management
+
+    ## PP -> USB MIDI input -> USB MIDI output -> Steinberg UR22mkII input
+    ## Virtual loopback input
+
+    input_device_name = "USB MIDI Interface 2" # PP Receiver (input)
+    output_device_name = "USB MIDI Interface 3" # Sender to ShowXpress MIDI (output)
+    loopback_device_name = "loopMIDI Port 1" # State tracking (input)
+
     process_name = "TheLightingController.exe"
 
     midi_monitor = MidiMonitor(input_device_name, output_device_name, loopback_device_name, process_name)
