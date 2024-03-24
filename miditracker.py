@@ -43,6 +43,7 @@ class MidiMonitor(threading.Thread):
         self._stop_event = threading.Event()
         self.note_state = {}  # Dictionary to store note intensity values
         self.note_buffer = {}  # Dictionary buffer for note proxy
+        self.note_buffer_lock = threading.Semaphore(1)  # Semaphore for locking note_buffer
 
     def stop(self):
         self._stop_event.set()
@@ -51,31 +52,35 @@ class MidiMonitor(threading.Thread):
         self.note_state = {}  # Reset note state dictionary
 
     def reset_note_buffer(self):
-        self.note_buffer = {}  # Reset note buffer
+        with self.note_buffer_lock:
+            self.note_buffer = {}  # Reset note buffer
 
     def send_note_on(self, note, channel, velocity=1):
         with mido.open_output(self.output_device_name) as port:
             port.send(mido.Message('note_on', note=note, velocity=velocity, channel=channel))
 
     def add_note_buffer(self, note, channel, velocity=1):
-        note_key = (note, channel)
-        self.note_buffer[note_key] = velocity
+        with self.note_buffer_lock:
+            note_key = (note, channel)
+            self.note_buffer[note_key] = velocity
 
     def remove_note_buffer(self, note, channel):
-        note_key = (note, channel)
-        self.note_buffer.pop(note_key)
+        with self.note_buffer_lock:
+            note_key = (note, channel)
+            self.note_buffer.pop(note_key)
 
     def send_note_buffer(self):
-        for key in list(self.note_buffer.keys()):
-            self.send_note_on(key[0], key[1], self.note_buffer[key])
-        self.reset_note_buffer()
+        with self.note_buffer_lock:
+            for key in list(self.note_buffer.keys()):
+                self.send_note_on(key[0], key[1], self.note_buffer[key])
+            self.reset_note_buffer()
 
     def buffer_thread_func(self):
         try:
             while not self._stop_event.is_set():
-                if len(self.midi_monitor.note_buffer) > 0:
+                if len(self.note_buffer) > 0:
                     time.sleep(0.1)  # Check every 0.1 seconds
-                    self.midi_monitor.send_note_buffer()
+                    self.send_note_buffer()
         except KeyboardInterrupt:
             pass
 
