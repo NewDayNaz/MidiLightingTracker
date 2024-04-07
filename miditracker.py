@@ -76,7 +76,7 @@ class MidiMonitor(threading.Thread):
         return (time.time() - write_time) > 0.05
 
     def update_state(self, msg):
-        if msg.type == 'note_on':
+        if msg.type == "note_on":
             # Update note intensity value
             if msg.velocity > 0:
                 self.state[(msg.channel, msg.note)] = True
@@ -87,7 +87,38 @@ class MidiMonitor(threading.Thread):
         self.state = {}  # Reset note state dictionary
 
     def process_hardware_msg(self, msg):
-        self.software_device.send(msg)
+        handled = False
+        msg_key = (msg.channel, msg.note)
+        if msg.type == "note_on":
+            if msg.velocity == 127: # special code, only turns on button
+                handled = True
+                print("Turn On:", msg)
+                has_state = msg_key in self.state
+                if (has_state and not self.state[msg_key]) or (not has_state):
+                    # toggle it back on
+                    self.write_prio_queue(
+                        mido.Message("note_on", channel=msg.channel, note=msg.note, velocity=1)
+                    )
+        if msg.type == "note_off":
+            handled = True
+            if msg.note == 127:
+                print("Clear All:", msg)
+                for key in list(self.state.keys()):
+                    if self.state[key] is True:
+                        self.write_prio_queue(
+                            mido.Message("note_on", channel=key[0], note=key[1], velocity=1)
+                        )
+            else:
+                # All note_off events, only turns off button
+                if msg_key in self.state and self.state[msg_key]:
+                    print("Turn Off:", msg)
+                    self.write_prio_queue(
+                        mido.Message("note_on", channel=msg.channel, note=msg.note, velocity=1)
+                    )
+
+        # process unhandled regular messages
+        if (not handled):
+            self.write_queue(msg)
 
     def hardware_thread_func(self):
         try:
@@ -117,7 +148,7 @@ class MidiMonitor(threading.Thread):
 
                 self.write_lock.release()
 
-                print(self.state)
+                # print(self.state)
 
                 if self._stop_event.is_set():
                     break
@@ -136,8 +167,8 @@ class MidiMonitor(threading.Thread):
                         self.software_device.send(pkt)
                         print("Prio Q:", pkt)
 
-                    if prio_len > 0 and queue_len > 0:
-                        time.sleep(0.05) # allow prio pkts to get processed first, wait 50ms
+                    if prio_len > 0:
+                        time.sleep(0.1) # allow prio pkts to get processed first, wait 100ms
 
                     for pkt in self.queue:
                         self.software_device.send(pkt)
