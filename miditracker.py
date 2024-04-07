@@ -19,8 +19,8 @@ class ProcessMonitor(threading.Thread):
         try:
             while not self._stop_event.is_set():
                 if not self.check_process():
-                    print(f"Process '{self.process_name}' is not running. Resetting note_intensity.")
-                    self.midi_monitor.reset_note_intensity()
+                    print(f"Process '{self.process_name}' is not running. Resetting state.")
+                    self.midi_monitor.reset_state()
                 time.sleep(5)  # Check every 5 seconds
         except KeyboardInterrupt:
             pass
@@ -33,88 +33,136 @@ class ProcessMonitor(threading.Thread):
         return False
 
 class MidiMonitor(threading.Thread):
-    def __init__(self, input_device_name, output_device_name, loopback_device_name, process_name):
+    def __init__(self, hardware_device_name, state_device_name, software_device_name, process_name):
         super().__init__()
-        self.input_device_name = input_device_name
-        self.output_device_name = output_device_name
-        self.loopback_device_name = loopback_device_name
+        self.hardware_device_name = hardware_device_name
+        self.state_device_name = state_device_name
+        self.software_device_name = software_device_name
+
+        self.hardware_device = mido.open_input(self.hardware_device_name)
+        self.state_device = mido.open_input(self.state_device_name)
+        self.software_device = mido.open_output(self.software_device_name)
+
         self.process_name = process_name
         self._stop_event = threading.Event()
-        self.note_intensity = {}  # Dictionary to store note intensity values
+        self.state = {}  # Dictionary to store note intensity values
+
+        self.write_lock = threading.Lock()
+        self.write_time = time.time()
+        self.prio_queue = []
+        self.queue = []
 
     def stop(self):
+        self.hardware_device.close()
+        self.state_device.close()
+        self.software_device.close()
         self._stop_event.set()
 
-    def reset_note_intensity(self):
-        self.note_intensity = {}  # Reset note intensity dictionary
+    def write_prio_queue(self, value):
+        self.write_time = time.time()
+        self.prio_queue.append(value)
 
-    def send_note_on(self, note, channel, velocity=1):
-        with mido.open_output(self.output_device_name) as port: # TODO: figure out how to do a loopback input
-            port.send(mido.Message('note_on', note=note, velocity=velocity, channel=channel))
+    def write_queue(self, value):
+        self.write_time = time.time()
+        self.queue.append(value)
+    
+    def flush_queue(self):
+        self.write_time = time.time()
+        self.prio_queue = []
+        self.queue = []
 
-    def input_thread_func(self):
+    # only allow pushing to the queue if nothing has written to it in 50ms
+    def can_push_queue(self, write_time):
+        return (time.time() - write_time) > 0.05
+
+    def update_state(self, msg):
+        if msg.type == 'note_on':
+            # Update note intensity value
+            if msg.velocity > 0:
+                self.state[(msg.channel, msg.note)] = True
+            elif msg.velocity == 0:
+                self.state[(msg.channel, msg.note)] = False
+
+    def reset_state(self):
+        self.state = {}  # Reset note state dictionary
+
+    def process_hardware_msg(self, msg):
+        self.software_device.send(msg)
+
+    def hardware_thread_func(self):
         try:
-            with mido.open_input(self.input_device_name) as port:
-                print(f"Monitoring MIDI input messages from {self.input_device_name}. Press Ctrl+C to exit.")
-                for message in port:
-                    self.handle_midi_message(message)
-                    if self._stop_event.is_set():
-                        break
+            for msg in self.hardware_device:
+                print("Hardware:", msg)
+                
+                # make sure queue doesn't get pushed
+                self.write_lock.acquire()
+                self.process_hardware_msg(msg)
+                self.write_lock.release()
+
+                if self._stop_event.is_set():
+                    break
         except KeyboardInterrupt:
             pass
 
-    def loopback_thread_func(self):
+    def state_thread_func(self):
         try:
-            with mido.open_input(self.loopback_device_name) as port:
-                print(f"Monitoring MIDI input messages from {self.loopback_device_name}. Press Ctrl+C to exit.")
-                for message in port:
-                    if message.type == 'note_on':
-                        # Update note intensity value
-                        if message.velocity > 0:
-                            self.note_intensity[(message.note, message.channel)] = True
-                        elif message.velocity == 0:
-                            self.note_intensity[(message.note, message.channel)] = False
+            for msg in self.state_device:
+                print("State: ", msg)
 
-                        print("loopback", message)
-                        print("loopback", self.note_intensity)
-                    
-                    if self._stop_event.is_set():
-                        break
+                # make sure queue doesn't get pushed
+                self.write_lock.acquire()
+
+                self.write_time = time.time()
+                self.update_state(msg)
+
+                self.write_lock.release()
+
+                print(self.state)
+
+                if self._stop_event.is_set():
+                    break
         except KeyboardInterrupt:
             pass
 
-    def handle_midi_message(self, message):
-        # TODO: figure out how to have a note_on msg that only turns something on
-        if message.type == 'note_on':
-            if message.velocity == 127:
-                note_channel = (message.note, message.channel)
-                time.sleep(0.05)
-                if note_channel in self.note_intensity and not self.note_intensity[note_channel]:
-                    self.send_note_on(message.note, message.channel) #toggle it back on
-        if message.type == 'note_off':
-            if message.note == 127:
-                for key in list(self.note_intensity.keys()):
-                    if self.note_intensity[key] is True:
-                        self.send_note_on(key[0], key[1])
-            else:
-                # Remove note intensity value upon note off event
-                note_channel = (message.note, message.channel)
-                if note_channel in self.note_intensity and self.note_intensity[note_channel]:
-                    self.send_note_on(message.note, message.channel)
+    def software_thread_func(self):
+        try:
+            while not self._stop_event.is_set():
+                time.sleep(0.005) # only check queue every 5ms
+                can_push_queue = self.can_push_queue(self.write_time)
+                if can_push_queue:
+                    prio_len = len(self.prio_queue)
+                    queue_len = len(self.queue)
+                    for pkt in self.prio_queue:
+                        self.software_device.send(pkt)
+                        print("Prio Q:", pkt)
 
-        # Print the MIDI message
-        print(message)
-        print(self.note_intensity)
+                    if prio_len > 0 and queue_len > 0:
+                        time.sleep(0.05) # allow prio pkts to get processed first, wait 50ms
+
+                    for pkt in self.queue:
+                        self.software_device.send(pkt)
+                        print("Q:", pkt)
+
+                    # flush queues
+                    if prio_len > 0 or queue_len > 0:
+                        self.write_lock.acquire()
+                        self.flush_queue()
+                        self.write_lock.release()
+        except KeyboardInterrupt:
+            pass
 
     def run(self):
         process_monitor = ProcessMonitor(self.process_name, self)
         process_monitor.start()
 
-        input_thread = threading.Thread(target=self.input_thread_func)
-        input_thread.start()
+        hardware_thread = threading.Thread(target=self.hardware_thread_func)
+        hardware_thread.start()
 
-        loopback_thread = threading.Thread(target=self.loopback_thread_func)
-        loopback_thread.start()
+        state_thread = threading.Thread(target=self.state_thread_func)
+        state_thread.start()
+
+        software_thread = threading.Thread(target=self.software_thread_func)
+        software_thread.start()
 
         try:
             while not self._stop_event.is_set():
@@ -124,8 +172,9 @@ class MidiMonitor(threading.Thread):
         finally:
             process_monitor.stop()
             process_monitor.join()
-            input_thread.join()
-            loopback_thread.join()
+            hardware_thread.join()
+            state_thread.join()
+            software_thread.join()
 
 def stop():
     os._exit(1)
@@ -134,14 +183,16 @@ def main():
     # Replace 'Your MIDI Device Name' with the name of your MIDI device
     # You can find the device name by printing the available ports
     # Example: print(mido.get_input_names())
-    print(mido.get_input_names())
-    print(mido.get_output_names())
-    input_device_name = 'Steinberg UR22mkII -1 0'
-    loopback_device_name = 'loopMIDI Port 1'
-    output_device_name = 'USB MIDI Interface 3'
+    print("MIDI Inputs:", mido.get_input_names())
+    print("MIDI Outputs:", mido.get_output_names())
+
+    hardware_device_name = 'Steinberg UR22mkII -1 0' # Input from controller, gets put into queue and passed on
+    state_device_name = 'loopMIDI Port 1' # DMX software is outputting button state to this
+    software_device_name = 'showXPress 3' # DMX software is using this as the input
+    
     process_name = "TheLightingController.exe"
 
-    midi_monitor = MidiMonitor(input_device_name, output_device_name, loopback_device_name, process_name)
+    midi_monitor = MidiMonitor(hardware_device_name, state_device_name, software_device_name, process_name)
     midi_monitor.start()
 
     try:
@@ -152,7 +203,7 @@ def main():
 
         midi_monitor.stop()
          # Wait for threads to terminate with a timeout
-        midi_monitor.join(timeout=3)  # Timeout set to 3 seconds
+        midi_monitor.join(timeout=1)  # Timeout set to 1 seconds
         if midi_monitor.is_alive():
             print("Threads failed to terminate. Exiting without clean shutdown.", file=sys.stderr)
             os._exit(1) # Exit with an error code if threads fail to terminate within the timeout
