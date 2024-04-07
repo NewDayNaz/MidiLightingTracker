@@ -46,11 +46,11 @@ class MidiMonitor(threading.Thread):
         self.process_name = process_name
         self._stop_event = threading.Event()
         self.state = {}  # Dictionary to store note intensity values
+        self.desired_state = {}
+        self.desired_clear_state = {}
 
         self.write_lock = threading.Lock()
         self.write_time = time.time()
-        self.prio_queue = []
-        self.queue = []
 
     def stop(self):
         self.hardware_device.close()
@@ -58,22 +58,40 @@ class MidiMonitor(threading.Thread):
         self.software_device.close()
         self._stop_event.set()
 
-    def write_prio_queue(self, value):
+    def desire_state_toggle(self, value):
         self.write_time = time.time()
-        self.prio_queue.append(value)
+        key = (value.channel, value.note)
+        has_key = key in self.state
+        if (not has_key) or (has_key and (not self.state[key])):
+            self.desired_state[key] = True
+        elif has_key and self.state[key]:
+            self.desired_state[key] = False
 
-    def write_queue(self, value):
+    def desire_state_on(self, value):
         self.write_time = time.time()
-        self.queue.append(value)
+        key = (value.channel, value.note)
+        self.desired_state[key] = True
+
+    def desire_state_off(self, value):
+        self.write_time = time.time()
+        key = (value.channel, value.note)
+        self.desired_state[key] = False
+
+    def desire_state_cleared(self, value):
+        self.write_time = time.time()
+        key = (value.channel, value.note)
+        has_desired_state = key in self.desired_clear_state
+        if not has_desired_state: # only enforce state if no one has requested one yet
+            self.desired_clear_state[key] = False
     
     def flush_queue(self):
         self.write_time = time.time()
-        self.prio_queue = []
-        self.queue = []
+        self.desired_state = {}
+        self.desired_clear_state = {}
 
-    # only allow pushing to the queue if nothing has written to it in 50ms
+    # only allow pushing to the queue if nothing has written to it in 100ms
     def can_push_queue(self, write_time):
-        return (time.time() - write_time) > 0.05
+        return (time.time() - write_time) > 0.1
 
     def update_state(self, msg):
         if msg.type == "note_on":
@@ -93,32 +111,27 @@ class MidiMonitor(threading.Thread):
             if msg.velocity == 127: # special code, only turns on button
                 handled = True
                 print("Turn On:", msg)
-                has_state = msg_key in self.state
-                if (has_state and not self.state[msg_key]) or (not has_state):
-                    # toggle it back on
-                    self.write_prio_queue(
-                        mido.Message("note_on", channel=msg.channel, note=msg.note, velocity=1)
-                    )
+                self.desire_state_on(
+                    mido.Message("note_on", channel=msg.channel, note=msg.note, velocity=1)
+                )
         if msg.type == "note_off":
             handled = True
-            if msg.note == 127:
+            if msg.note == 127: # special code, clear all active buttons
                 print("Clear All:", msg)
                 for key in list(self.state.keys()):
-                    if self.state[key] is True:
-                        self.write_prio_queue(
-                            mido.Message("note_on", channel=key[0], note=key[1], velocity=1)
-                        )
+                    self.desire_state_cleared(
+                        mido.Message("note_on", channel=key[0], note=key[1], velocity=1)
+                    )
             else:
                 # All note_off events, only turns off button
-                if msg_key in self.state and self.state[msg_key]:
-                    print("Turn Off:", msg)
-                    self.write_prio_queue(
-                        mido.Message("note_on", channel=msg.channel, note=msg.note, velocity=1)
-                    )
+                print("Turn Off:", msg)
+                self.desire_state_off(
+                    mido.Message("note_on", channel=msg.channel, note=msg.note, velocity=1)
+                )
 
         # process unhandled regular messages
         if (not handled):
-            self.write_queue(msg)
+            self.desire_state_toggle(msg)
 
     def hardware_thread_func(self):
         try:
@@ -142,10 +155,8 @@ class MidiMonitor(threading.Thread):
 
                 # make sure queue doesn't get pushed
                 self.write_lock.acquire()
-
                 self.write_time = time.time()
                 self.update_state(msg)
-
                 self.write_lock.release()
 
                 # print(self.state)
@@ -161,21 +172,29 @@ class MidiMonitor(threading.Thread):
                 time.sleep(0.005) # only check queue every 5ms
                 can_push_queue = self.can_push_queue(self.write_time)
                 if can_push_queue:
-                    prio_len = len(self.prio_queue)
-                    queue_len = len(self.queue)
-                    for pkt in self.prio_queue:
-                        self.software_device.send(pkt)
-                        print("Prio Q:", pkt)
+                    desired_state_len = len(self.desired_state)
+                    desired_clear_state_len = len(self.desired_clear_state)
+                    if desired_state_len > 0 or desired_clear_state_len > 0:
+                        print("Desired:", self.desired_state)
+                        print("Clear Desired:", self.desired_clear_state)
+                    for key in list(self.desired_clear_state.keys()):
+                        print("CQ:", key)
+                        if not (key in self.desired_state): # only clear state if no pre-existing intent
+                            self.desired_state[key] = False
 
-                    if prio_len > 0:
-                        time.sleep(0.1) # allow prio pkts to get processed first, wait 100ms
+                    for key in list(self.desired_state.keys()):
+                        state_desire = self.desired_state[key]
+                        state_current = False
+                        if key in self.state:
+                            state_current = self.state[key]
 
-                    for pkt in self.queue:
-                        self.software_device.send(pkt)
-                        print("Q:", pkt)
+                        if state_current != state_desire:
+                            msg = mido.Message("note_on", channel=key[0], note=key[1], velocity=1)
+                            self.software_device.send(msg)
+                            print("Q:", msg)
 
                     # flush queues
-                    if prio_len > 0 or queue_len > 0:
+                    if desired_state_len > 0 or desired_clear_state_len > 0:
                         self.write_lock.acquire()
                         self.flush_queue()
                         self.write_lock.release()
