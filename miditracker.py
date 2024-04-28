@@ -185,7 +185,10 @@ class MidiMonitor(threading.Thread):
 
         # process unhandled regular messages
         if (not handled):
-            self.desire_state_toggle(msg)
+            msg = mido.Message("note_on", channel=msg_channel, note=msg.note, velocity=1)
+            self.software_device.send(msg)
+            print("Toggle:", msg)
+            # self.desire_state_toggle(msg)
 
     def hardware_thread_func(self):
         try:
