@@ -12,8 +12,50 @@ class ProcessMonitor(threading.Thread):
         self.midi_monitor = midi_monitor
         self._stop_event = threading.Event()
 
+        # self.test_buggyness()
+
     def stop(self):
         self._stop_event.set()
+
+    def test_buggyness(self):
+        self.midi_monitor.write_time = time.time() + 1
+        self.midi_monitor.write_lock.acquire()
+        # sermon on 
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=14, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=7, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=6, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=8, velocity=1, time=0))
+        self.midi_monitor.write_lock.release()
+        while not self.midi_monitor.can_push_queue(self.midi_monitor.write_time):
+            do_nothing = 1
+        # sceneish
+        self.midi_monitor.write_time = time.time() + 0.2
+        self.midi_monitor.write_lock.acquire()
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=15, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=20, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=8, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=6, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=5, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=40, velocity=1, time=0))
+        self.midi_monitor.write_lock.release()
+        while not self.midi_monitor.can_push_queue(self.midi_monitor.write_time):
+            do_nothing = 1
+        # clear all 
+        self.midi_monitor.write_time = time.time() + 0.2
+        self.midi_monitor.write_lock.acquire()
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_off", channel=0, note=127, velocity=0, time=0))
+        self.midi_monitor.write_lock.release()
+        while not self.midi_monitor.can_push_queue(self.midi_monitor.write_time):
+            do_nothing = 1
+        # rest of scene
+        self.midi_monitor.write_time = time.time() + 0.2
+        self.midi_monitor.write_lock.acquire()
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=18, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=17, velocity=1, time=0))
+        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=4, velocity=1, time=0))
+        self.midi_monitor.write_lock.release()
+        while not self.midi_monitor.can_push_queue(self.midi_monitor.write_time):
+            do_nothing = 1
 
     def run(self):
         try:
@@ -60,7 +102,12 @@ class MidiMonitor(threading.Thread):
 
     def desire_state_toggle(self, value):
         self.write_time = time.time()
-        key = (value.channel, value.note)
+
+        msg_channel = 0
+        if hasattr(value, "channel"):
+            msg_channel = value.channel
+
+        key = (msg_channel, value.note)
         has_key = key in self.state
         if (not has_key) or (has_key and (not self.state[key])):
             self.desired_state[key] = True
@@ -94,25 +141,32 @@ class MidiMonitor(threading.Thread):
         return (time.time() - write_time) > 0.1
 
     def update_state(self, msg):
+        msg_channel = 0
+        if hasattr(msg, "channel"):
+            msg_channel = msg.channel
+
         if msg.type == "note_on":
             # Update note intensity value
             if msg.velocity > 0:
-                self.state[(msg.channel, msg.note)] = True
+                self.state[(msg_channel, msg.note)] = True
             elif msg.velocity == 0:
-                self.state[(msg.channel, msg.note)] = False
+                self.state[(msg_channel, msg.note)] = False
 
     def reset_state(self):
         self.state = {}  # Reset note state dictionary
 
     def process_hardware_msg(self, msg):
         handled = False
-        msg_key = (msg.channel, msg.note)
+        msg_channel = 0
+        if hasattr(msg, "channel"):
+            msg_channel = msg.channel
+
         if msg.type == "note_on":
             if msg.velocity == 127: # special code, only turns on button
                 handled = True
                 print("Turn On:", msg)
                 self.desire_state_on(
-                    mido.Message("note_on", channel=msg.channel, note=msg.note, velocity=1)
+                    mido.Message("note_on", channel=msg_channel, note=msg.note, velocity=1)
                 )
         if msg.type == "note_off":
             handled = True
@@ -126,7 +180,7 @@ class MidiMonitor(threading.Thread):
                 # All note_off events, only turns off button
                 print("Turn Off:", msg)
                 self.desire_state_off(
-                    mido.Message("note_on", channel=msg.channel, note=msg.note, velocity=1)
+                    mido.Message("note_on", channel=msg_channel, note=msg.note, velocity=1)
                 )
 
         # process unhandled regular messages
@@ -151,15 +205,13 @@ class MidiMonitor(threading.Thread):
     def state_thread_func(self):
         try:
             for msg in self.state_device:
-                print("State: ", msg)
+                # print("State: ", msg)
 
                 # make sure queue doesn't get pushed
                 self.write_lock.acquire()
-                self.write_time = time.time()
+                self.write_time = time.time() + 0.005 # delay queue push by 5ms more after state change
                 self.update_state(msg)
                 self.write_lock.release()
-
-                # print(self.state)
 
                 if self._stop_event.is_set():
                     break
@@ -175,12 +227,16 @@ class MidiMonitor(threading.Thread):
                     desired_state_len = len(self.desired_state)
                     desired_clear_state_len = len(self.desired_clear_state)
                     if desired_state_len > 0 or desired_clear_state_len > 0:
-                        print("Desired:", self.desired_state)
+                        print("Pre State:", self.state)
+                        print("Pre Desired:", self.desired_state)
                         print("Clear Desired:", self.desired_clear_state)
+
                     for key in list(self.desired_clear_state.keys()):
-                        print("CQ:", key)
                         if not (key in self.desired_state): # only clear state if no pre-existing intent
                             self.desired_state[key] = False
+
+                    if desired_state_len > 0 or desired_clear_state_len > 0:
+                        print("Post Desired:", self.desired_state)
 
                     for key in list(self.desired_state.keys()):
                         state_desire = self.desired_state[key]
@@ -191,11 +247,13 @@ class MidiMonitor(threading.Thread):
                         if state_current != state_desire:
                             msg = mido.Message("note_on", channel=key[0], note=key[1], velocity=1)
                             self.software_device.send(msg)
-                            print("Q:", msg)
+                            print("Toggle:", msg)
 
                     # flush queues
                     if desired_state_len > 0 or desired_clear_state_len > 0:
+                        print("Post State:", self.state)
                         self.write_lock.acquire()
+                        self.write_time = time.time()
                         self.flush_queue()
                         self.write_lock.release()
         except KeyboardInterrupt:
