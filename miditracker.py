@@ -1,6 +1,8 @@
 import logging
+import logging.handlers
 import mido
 import threading
+import pathlib
 import psutil
 import sys
 import os
@@ -8,6 +10,10 @@ import time
 
 logger = logging.getLogger(__name__)
 launch_time = time.time()
+
+LOG_DIRECTORY = pathlib.Path(__file__).parent.resolve().absolute()
+
+WRITE_TO_MIDI = False
 
 class ProcessMonitor(threading.Thread):
     def __init__(self, process_name, midi_monitor):
@@ -94,6 +100,7 @@ class MidiMonitor(threading.Thread):
             self.desired_clear_state[key] = False
     
     def flush_queue(self):
+        # logger.info('Flush Queue')
         self.write_time = time.time()
         self.desired_state = {}
         self.desired_clear_state = {}
@@ -115,6 +122,7 @@ class MidiMonitor(threading.Thread):
                 self.state[(msg_channel, msg.note)] = False
 
     def reset_state(self):
+        # logger.info('Reset State')
         self.state = {}  # Reset note state dictionary
 
     def process_hardware_msg(self, msg):
@@ -150,7 +158,8 @@ class MidiMonitor(threading.Thread):
         # process unhandled regular messages
         if (not handled):
             msg = mido.Message("note_on", channel=msg_channel, note=msg.note, velocity=1)
-            self.software_device.send(msg)
+            if WRITE_TO_MIDI:
+                self.software_device.send(msg)
             print("Toggle:", msg)
             # self.desire_state_toggle(msg)
 
@@ -173,6 +182,10 @@ class MidiMonitor(threading.Thread):
         try:
             for msg in self.state_device:
                 # print("State: ", msg)
+                msg_channel = 0
+                if hasattr(msg, "channel"):
+                    msg_channel = msg.channel
+                logger.info('State CH:{0} Note:{1} Vel:{2}'.format(msg_channel, msg.note, msg.velocity))
 
                 # make sure queue doesn't get pushed
                 self.write_lock.acquire()
@@ -213,7 +226,8 @@ class MidiMonitor(threading.Thread):
 
                         if state_current != state_desire:
                             msg = mido.Message("note_on", channel=key[0], note=key[1], velocity=1)
-                            self.software_device.send(msg)
+                            if WRITE_TO_MIDI:
+                                self.software_device.send(msg)
                             print("Toggle:", msg)
 
                     # flush queues
@@ -256,10 +270,12 @@ def stop():
 
 class UnixTimeFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
-        return str(int(record.created) - int(launch_time))
+        return str(record.created - launch_time)
 
 def main():
-    handler = logging.StreamHandler()
+    LOG_FILE = str(LOG_DIRECTORY) + '\midi.log'
+    print("Logging file:", LOG_FILE)
+    handler = logging.handlers.TimedRotatingFileHandler(LOG_FILE, when='midnight', backupCount=12)
     formatter = UnixTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
