@@ -1,9 +1,13 @@
+import logging
 import mido
 import threading
 import psutil
 import sys
 import os
 import time
+
+logger = logging.getLogger(__name__)
+launch_time = time.time()
 
 class ProcessMonitor(threading.Thread):
     def __init__(self, process_name, midi_monitor):
@@ -12,50 +16,8 @@ class ProcessMonitor(threading.Thread):
         self.midi_monitor = midi_monitor
         self._stop_event = threading.Event()
 
-        # self.test_buggyness()
-
     def stop(self):
         self._stop_event.set()
-
-    def test_buggyness(self):
-        self.midi_monitor.write_time = time.time() + 1
-        self.midi_monitor.write_lock.acquire()
-        # sermon on 
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=14, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=7, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=6, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=8, velocity=1, time=0))
-        self.midi_monitor.write_lock.release()
-        while not self.midi_monitor.can_push_queue(self.midi_monitor.write_time):
-            do_nothing = 1
-        # sceneish
-        self.midi_monitor.write_time = time.time() + 0.2
-        self.midi_monitor.write_lock.acquire()
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=15, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=20, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=8, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=6, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=5, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=40, velocity=1, time=0))
-        self.midi_monitor.write_lock.release()
-        while not self.midi_monitor.can_push_queue(self.midi_monitor.write_time):
-            do_nothing = 1
-        # clear all 
-        self.midi_monitor.write_time = time.time() + 0.2
-        self.midi_monitor.write_lock.acquire()
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_off", channel=0, note=127, velocity=0, time=0))
-        self.midi_monitor.write_lock.release()
-        while not self.midi_monitor.can_push_queue(self.midi_monitor.write_time):
-            do_nothing = 1
-        # rest of scene
-        self.midi_monitor.write_time = time.time() + 0.2
-        self.midi_monitor.write_lock.acquire()
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=18, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=17, velocity=1, time=0))
-        self.midi_monitor.process_hardware_msg(msg=mido.Message("note_on", channel=0, note=4, velocity=1, time=0))
-        self.midi_monitor.write_lock.release()
-        while not self.midi_monitor.can_push_queue(self.midi_monitor.write_time):
-            do_nothing = 1
 
     def run(self):
         try:
@@ -160,6 +122,8 @@ class MidiMonitor(threading.Thread):
         msg_channel = 0
         if hasattr(msg, "channel"):
             msg_channel = msg.channel
+
+        logger.info('{0} CH:{1} Note:{2} Vel:{3}'.format(msg.type, msg.channel, msg.note, msg.velocity))
 
         if msg.type == "note_on":
             if msg.velocity == 127: # special code, only turns on button
@@ -290,7 +254,17 @@ class MidiMonitor(threading.Thread):
 def stop():
     os._exit(1)
 
+class UnixTimeFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        return str(int(record.created) - int(launch_time))
+
 def main():
+    handler = logging.StreamHandler()
+    formatter = UnixTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
     # Replace 'Your MIDI Device Name' with the name of your MIDI device
     # You can find the device name by printing the available ports
     # Example: print(mido.get_input_names())
