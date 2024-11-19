@@ -1,96 +1,261 @@
+import logging
+import logging.handlers
+import mido
 import threading
+import pathlib
+import psutil
+import sys
+import os
 import time
-import queue
+from queue import Queue
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
 
-class MidiStateHandler:
-    def __init__(self):
-        self.state = {}
-        self.desired_state_queue = queue.Queue()  # Thread-safe queue for state changes
-        self.lock = threading.Lock()
-        self.hardware_msgs_queue = queue.Queue()  # Queue for hardware messages
-        self.write_event = threading.Event()  # Event to notify software thread
-        self.running = True
+logger = logging.getLogger(__name__)
+launch_time = time.time()
 
-    def state_thread_func(self):
-        """
-        Thread to monitor and push updates to the desired state queue.
-        """
-        while self.running:
-            with self.lock:
-                current_state = self.state.copy()  # Copy to work on without holding lock
-            # Push state changes to the desired_state_queue
-            for key, value in current_state.items():
-                self.desired_state_queue.put((key, value))  # Enqueue desired state changes
+LOG_DIRECTORY = pathlib.Path(__file__).parent.resolve().absolute()
+WRITE_TO_MIDI = False
 
-            time.sleep(0.1)  # Add delay to avoid excessive CPU usage
+@dataclass
+class StateChange:
+    channel: int
+    note: int
+    value: bool
+    timestamp: float
 
-    def software_thread_func(self):
-        """
-        Thread to process the desired state queue and send MIDI messages.
-        """
-        while self.running:
-            try:
-                # Wait for a state change notification or timeout
-                key, value = self.desired_state_queue.get(timeout=0.1)
-                # Process the desired state update
-                self.send_midi_message(key, value)
-            except queue.Empty:
-                pass  # Timeout, no state changes to process
-
-    def hardware_thread_func(self):
-        """
-        Thread to monitor hardware messages and update the state.
-        """
-        while self.running:
-            try:
-                hardware_msg = self.hardware_msgs_queue.get(timeout=0.1)  # Simulate receiving a hardware message
-                self.process_hardware_msg(hardware_msg)
-            except queue.Empty:
-                pass  # No messages received
-
-    def process_hardware_msg(self, msg):
-        """
-        Process a message from hardware and update the state.
-        """
-        with self.lock:
-            # Update the shared state based on hardware message
-            self.state[msg['key']] = msg['value']
-            # Notify the software thread about state changes
-            self.desired_state_queue.put((msg['key'], msg['value']))
-            self.write_event.set()
-
-    def send_midi_message(self, key, value):
-        """
-        Simulate sending a MIDI message.
-        """
-        print(f"Sending MIDI message: {key} -> {value}")
+class ProcessMonitor(threading.Thread):
+    def __init__(self, process_name, midi_monitor):
+        super().__init__()
+        self.process_name = process_name
+        self.midi_monitor = midi_monitor
+        self._stop_event = threading.Event()
 
     def stop(self):
-        """
-        Stop all threads.
-        """
-        self.running = False
-        self.write_event.set()  # Wake up any waiting threads
+        self._stop_event.set()
 
+    def run(self):
+        try:
+            while not self._stop_event.is_set():
+                if not self.check_process():
+                    print(f"Process '{self.process_name}' is not running. Resetting state.")
+                    self.midi_monitor.reset_state()
+                time.sleep(5)
+        except KeyboardInterrupt:
+            pass
 
-# Example of usage
-midi_handler = MidiStateHandler()
+    def check_process(self):
+        for proc in psutil.process_iter(['pid', 'name']):
+            if proc.info['name'] == self.process_name:
+                return True
+        return False
 
-state_thread = threading.Thread(target=midi_handler.state_thread_func, daemon=True)
-software_thread = threading.Thread(target=midi_handler.software_thread_func, daemon=True)
-hardware_thread = threading.Thread(target=midi_handler.hardware_thread_func, daemon=True)
+class MidiMonitor(threading.Thread):
+    def __init__(self, hardware_device_name, state_device_name, software_device_name, process_name):
+        super().__init__()
+        self.hardware_device_name = hardware_device_name
+        self.state_device_name = state_device_name
+        self.software_device_name = software_device_name
+        self.process_name = process_name
+        
+        # Thread-safe queues for message passing
+        self.state_queue = Queue()
+        self.hardware_queue = Queue()
+        self.output_queue = Queue()
+        
+        # Thread synchronization
+        self._stop_event = threading.Event()
+        self.state_lock = threading.Lock()
+        
+        # State management
+        self.current_state: Dict[Tuple[int, int], bool] = {}
+        self.pending_changes: Dict[Tuple[int, int], StateChange] = {}
+        
+        # Device initialization
+        self.hardware_device = mido.open_input(self.hardware_device_name)
+        self.state_device = mido.open_input(self.state_device_name)
+        self.software_device = mido.open_output(self.software_device_name)
 
-state_thread.start()
-software_thread.start()
-hardware_thread.start()
+    def stop(self):
+        self._stop_event.set()
+        self.hardware_device.close()
+        self.state_device.close()
+        self.software_device.close()
 
-# Simulate hardware messages
-for i in range(10):
-    midi_handler.hardware_msgs_queue.put({'key': f'note_{i}', 'value': i})
-    time.sleep(0.05)
+    def reset_state(self):
+        with self.state_lock:
+            self.current_state.clear()
+            self.pending_changes.clear()
 
-midi_handler.stop()
+    def process_hardware_message(self, msg: mido.Message) -> Optional[StateChange]:
+        channel = getattr(msg, 'channel', 0)
+        logger.info(f'Hardware CH:{channel} Note:{msg.note} Vel:{msg.velocity}')
 
-state_thread.join()
-software_thread.join()
-hardware_thread.join()
+        if msg.type == "note_on" and msg.velocity == 127:
+            # Special code to turn on button
+            return StateChange(channel, msg.note, True, time.time())
+        elif msg.type == "note_off":
+            if msg.note == 127:
+                # Special code to clear all buttons
+                with self.state_lock:
+                    for key in self.current_state.keys():
+                        self.output_queue.put(
+                            StateChange(key[0], key[1], False, time.time())
+                        )
+                return None
+            else:
+                # Turn off specific button
+                return StateChange(channel, msg.note, False, time.time())
+        elif msg.type == "note_on":
+            # Toggle button state
+            current_state = False
+            with self.state_lock:
+                current_state = self.current_state.get((channel, msg.note), False)
+            return StateChange(channel, msg.note, not current_state, time.time())
+        
+        return None
+
+    def process_state_message(self, msg: mido.Message):
+        channel = getattr(msg, 'channel', 0)
+        if msg.type == "note_on":
+            with self.state_lock:
+                self.current_state[(channel, msg.note)] = msg.velocity > 0
+                # Clean up any pending changes for this note
+                self.pending_changes.pop((channel, msg.note), None)
+
+    def hardware_thread_func(self):
+        try:
+            for msg in self.hardware_device:
+                if self._stop_event.is_set():
+                    break
+                
+                state_change = self.process_hardware_message(msg)
+                if state_change:
+                    self.output_queue.put(state_change)
+                
+                if WRITE_TO_MIDI:
+                    self.software_device.send(msg)
+        except KeyboardInterrupt:
+            pass
+
+    def state_thread_func(self):
+        try:
+            for msg in self.state_device:
+                if self._stop_event.is_set():
+                    break
+                
+                channel = getattr(msg, 'channel', 0)
+                logger.info(f'State CH:{channel} Note:{msg.note} Vel:{msg.velocity}')
+                self.process_state_message(msg)
+        except KeyboardInterrupt:
+            pass
+
+    def output_thread_func(self):
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    state_change = self.output_queue.get(timeout=0.1)
+                    current_time = time.time()
+                    
+                    # Only process if enough time has passed since the last change
+                    key = (state_change.channel, state_change.note)
+                    
+                    with self.state_lock:
+                        pending = self.pending_changes.get(key)
+                        current_state = self.current_state.get(key, False)
+                        
+                        if (not pending or 
+                            current_time - pending.timestamp >= 0.1) and \
+                            current_state != state_change.value:
+                            
+                            # Send MIDI message
+                            msg = mido.Message(
+                                "note_on",
+                                channel=state_change.channel,
+                                note=state_change.note,
+                                velocity=1 if state_change.value else 0
+                            )
+                            if WRITE_TO_MIDI:
+                                self.software_device.send(msg)
+                            print(f"Sending: {msg}")
+                            
+                            # Update pending changes
+                            self.pending_changes[key] = state_change
+                            
+                except Queue.Empty:
+                    continue
+        except KeyboardInterrupt:
+            pass
+
+    def run(self):
+        process_monitor = ProcessMonitor(self.process_name, self)
+        threads = [
+            (process_monitor, "Process Monitor"),
+            (threading.Thread(target=self.hardware_thread_func), "Hardware Thread"),
+            (threading.Thread(target=self.state_thread_func), "State Thread"),
+            (threading.Thread(target=self.output_thread_func), "Output Thread")
+        ]
+        
+        # Start all threads
+        for thread, name in threads:
+            thread.start()
+            print(f"Started {name}")
+
+        try:
+            while not self._stop_event.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._stop_event.set()
+            for thread, name in threads:
+                print(f"Stopping {name}")
+                if isinstance(thread, ProcessMonitor):
+                    thread.stop()
+                thread.join(timeout=1)
+                if thread.is_alive():
+                    print(f"{name} failed to terminate properly")
+
+class UnixTimeFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        return str(record.created - launch_time)
+
+def main():
+    LOG_FILE = str(LOG_DIRECTORY) + '\midi.log'
+    print("Logging file:", LOG_FILE)
+    handler = logging.handlers.TimedRotatingFileHandler(LOG_FILE, when='midnight', backupCount=12)
+    formatter = UnixTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+    # Replace 'Your MIDI Device Name' with the name of your MIDI device
+    # You can find the device name by printing the available ports
+    # Example: print(mido.get_input_names())
+    print("MIDI Inputs:", mido.get_input_names())
+    print("MIDI Outputs:", mido.get_output_names())
+
+    hardware_device_name = 'Steinberg UR22mkII -1 0' # Input from controller, gets put into queue and passed on
+    state_device_name = 'loopMIDI Port 1' # DMX software is outputting button state to this
+    software_device_name = 'showXPress 3' # DMX software is using this as the input
+    
+    process_name = "TheLightingController.exe"
+
+    midi_monitor = MidiMonitor(hardware_device_name, state_device_name, software_device_name, process_name)
+    midi_monitor.start()
+
+    try:
+        while True:
+            pass
+    except KeyboardInterrupt:
+        print("\nStopping MIDI monitoring...")
+
+        midi_monitor.stop()
+         # Wait for threads to terminate with a timeout
+        midi_monitor.join(timeout=1)  # Timeout set to 1 seconds
+        if midi_monitor.is_alive():
+            print("Threads failed to terminate. Exiting without clean shutdown.", file=sys.stderr)
+            os._exit(1) # Exit with an error code if threads fail to terminate within the timeout
+
+if __name__ == "__main__":
+    main()
