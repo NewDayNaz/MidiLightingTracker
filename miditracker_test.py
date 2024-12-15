@@ -38,7 +38,7 @@ class ProcessMonitor(threading.Thread):
         try:
             while not self._stop_event.is_set():
                 if not self.check_process():
-                    print(f"Process '{self.process_name}' is not running. Resetting state.")
+                    logger.info(f"Process '{self.process_name}' is not running. Resetting state.")
                     self.midi_monitor.reset_state()
                 time.sleep(5)
         except KeyboardInterrupt:
@@ -93,24 +93,28 @@ class MidiMonitor(threading.Thread):
 
         if msg.type == "note_on" and msg.velocity == 127:
             # Special code to turn on button
+            logger.info(f"Turning on CH:{channel} Note:{msg.note}.")
             return StateChange(channel, msg.note, True, time.time())
         elif msg.type == "note_off":
             if msg.note == 127:
                 # Special code to clear all buttons
                 with self.state_lock:
                     for key in self.current_state.keys():
+                        logger.info(f"Queueing turning off CH:{key[0]} Note:{key[1]}.")
                         self.output_queue.put(
                             StateChange(key[0], key[1], False, time.time())
                         )
                 return None
             else:
                 # Turn off specific button
+                logger.info(f"Turning off CH:{channel} Note:{msg.note}.")
                 return StateChange(channel, msg.note, False, time.time())
         elif msg.type == "note_on":
             # Toggle button state
             current_state = False
             with self.state_lock:
                 current_state = self.current_state.get((channel, msg.note), False)
+                logger.info(f"Changing state of CH:{channel} Note:{msg.note} from {current_state} to {not current_state}.")
             return StateChange(channel, msg.note, not current_state, time.time())
         
         return None
@@ -119,6 +123,7 @@ class MidiMonitor(threading.Thread):
         channel = getattr(msg, 'channel', 0)
         if msg.type == "note_on":
             with self.state_lock:
+                logger.info(f"Updating state of CH:{channel} Note:{msg.note} to {msg.velocity > 0}")
                 self.current_state[(channel, msg.note)] = msg.velocity > 0
                 # Clean up any pending changes for this note
                 self.pending_changes.pop((channel, msg.note), None)
@@ -177,7 +182,9 @@ class MidiMonitor(threading.Thread):
                             )
                             if WRITE_TO_MIDI:
                                 self.software_device.send(msg)
-                            print(f"Sending: {msg}")
+                                logger.info(f"Sending MIDI {msg}")
+                            else:
+                                logger.info(f"Debug not sending MIDI {msg}")
                             
                             # Update pending changes
                             self.pending_changes[key] = state_change
